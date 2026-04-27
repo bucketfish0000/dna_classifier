@@ -1,0 +1,38 @@
+# Python bytecode and caches
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments and local env files
+.env
+.env.*
+.venv/
+venv/
+env/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Generated scheduler/runtime logs
+logs/*
+!logs/
+!logs/*.pbs
+
+# Generated datasets; keep the code and helper scripts in this directory tracked
+data/*
+!data/
+!data/*.py
+!data/*.sh
+
+# Common experiment artifacts
+checkpoints/
+runs/
+wandb/
+tensorboard/
+*.pt
+*.pth
+*.ckpt

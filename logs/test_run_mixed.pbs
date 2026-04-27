@@ -1,0 +1,54 @@
+#!/bin/bash
+#PBS -l ngpus=1
+#PBS -l ncpus=8
+#PBS -l mem=40g
+#PBS -l walltime=24:00:00
+#PBS -q workq
+#PBS -N dna_training_mixed
+#PBS -M tml6120@psu.edu
+#PBS -m bea
+
+set -e
+
+cd "$PBS_O_WORKDIR"
+
+echo "===== JOB START ====="
+date
+
+source /usr/local/anaconda3/etc/profile.d/conda.sh
+conda activate tara
+
+export HF_HOME=/scratch/tml6120/hf_cache
+export HUGGINGFACE_HUB_CACHE="$HF_HOME/hub"
+export TRANSFORMERS_CACHE="$HF_HOME/transformers"
+export HF_DATASETS_CACHE="$HF_HOME/datasets"
+mkdir -p "$HUGGINGFACE_HUB_CACHE" "$TRANSFORMERS_CACHE" "$HF_DATASETS_CACHE"
+
+LOG_DIR="${LOG_DIR:-/scratch/tml6120/dna_grouper/logs}"
+mkdir -p "$LOG_DIR"
+LOG_NAME="${LOG_NAME:-${PBS_JOBNAME}_${PBS_JOBID}.log}"
+
+python /scratch/tml6120/dna_grouper/train_relation_model.py \
+  --data-root /home/grads/tml6120/workspace/dna_grouper/data/mixed_segmented_uniform \
+  --families-per-episode-min 6 \
+  --families-per-episode-max 32 \
+  --epochs 10 \
+  --encoder-only-epochs 100 \
+  --set-only-epochs 100 \
+  --head-only-epochs 100 \
+  --train-episodes-per-epoch 1024 \
+  --eval-episodes 512 \
+  --batch-size 16 \
+  --episode-size 32 \
+  --learning-rate 5e-4 \
+  --positive-weight-scale 1.0 \
+  --diagonal-weight 0.02 \
+  --alternate-epochs \
+  --relation-head-type cosine \
+  --set-num-heads 4 \
+  --set-num-layers 8 \
+  --set-dropout 0.15 \
+  2>&1 | tee "$LOG_DIR/$LOG_NAME"
+
+echo "===== JOB END ====="
+date
