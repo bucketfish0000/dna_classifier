@@ -3,7 +3,8 @@
 
 This script builds a family-level train/val/test split from synthetic DNA
 templates. Each family starts from a template sequence, and member sequences are
-created by independent substitution mutations with a per-sample mutation rate.
+created by independent substitution mutations with optional insertion/deletion
+mutations.
 
 Outputs are flat JSONL files so downstream PyTorch code can build pairwise,
 triplet, or episodic datasets without needing to reshape the raw data first.
@@ -25,7 +26,7 @@ DNA_ALPHABET: Tuple[str, ...] = ("A", "C", "G", "T")
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate synthetic DNA families with substitution mutations."
+        description="Generate synthetic DNA families with substitution and optional indel mutations."
     )
     parser.add_argument(
         "--output-dir",
@@ -92,6 +93,33 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.10,
         help="Maximum per-sample substitution rate.",
+    )
+    parser.add_argument(
+        "--indel-rate-min",
+        type=float,
+        default=0.0,
+        help=(
+            "Minimum per-sample insertion/deletion rate. Insertions and deletions "
+            "are sampled with equal rates so net length change is centered at 0."
+        ),
+    )
+    parser.add_argument(
+        "--indel-rate-max",
+        type=float,
+        default=0.0,
+        help=(
+            "Maximum per-sample insertion/deletion rate. Insertions and deletions "
+            "are sampled with equal rates so net length change is centered at 0."
+        ),
+    )
+    parser.add_argument(
+        "--max-length-delta-ratio",
+        type=float,
+        default=0.05,
+        help=(
+            "Maximum absolute net indel length change as a fraction of template "
+            "length. Set to 0 to force length-preserving indel counts."
+        ),
     )
     parser.add_argument(
         "--train-frac",
@@ -184,6 +212,15 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("Theta bounds must lie in [0, 1].")
     if args.theta_min > args.theta_max:
         raise ValueError("--theta-min cannot exceed --theta-max.")
+    if (
+        not 0.0 <= args.indel_rate_min <= 1.0
+        or not 0.0 <= args.indel_rate_max <= 1.0
+    ):
+        raise ValueError("Indel rate bounds must lie in [0, 1].")
+    if args.indel_rate_min > args.indel_rate_max:
+        raise ValueError("--indel-rate-min cannot exceed --indel-rate-max.")
+    if args.max_length_delta_ratio < 0.0:
+        raise ValueError("--max-length-delta-ratio must be non-negative.")
     if args.max_homopolymer_run <= 0:
         raise ValueError("--max-homopolymer-run must be positive.")
     if args.template_distance_ratio < 0.0 or args.template_distance_ratio > 1.0:
@@ -263,19 +300,93 @@ def gc_content_of(sequence: str) -> float:
     return gc_count / len(sequence)
 
 
+def sample_inserted_base(
+    rng: random.Random, base_distribution: Dict[str, float] | None = None
+) -> str:
+    if base_distribution is None:
+        return rng.choice(DNA_ALPHABET)
+    weights = [base_distribution[base] for base in DNA_ALPHABET]
+    return rng.choices(DNA_ALPHABET, weights=weights, k=1)[0]
+
+
+def cap_net_length_delta(
+    rng: random.Random,
+    insertion_positions: List[int],
+    deletion_positions: List[int],
+    max_length_delta: int,
+) -> Tuple[List[int], List[int]]:
+    net_delta = len(insertion_positions) - len(deletion_positions)
+    if abs(net_delta) <= max_length_delta:
+        return insertion_positions, deletion_positions
+
+    if net_delta > max_length_delta:
+        keep_count = len(deletion_positions) + max_length_delta
+        insertion_positions = rng.sample(insertion_positions, keep_count)
+    else:
+        keep_count = len(insertion_positions) + max_length_delta
+        deletion_positions = rng.sample(deletion_positions, keep_count)
+
+    insertion_positions.sort()
+    deletion_positions.sort()
+    return insertion_positions, deletion_positions
+
+
 def mutate_sequence(
-    rng: random.Random, template: str, theta: float
-) -> Tuple[str, List[Dict[str, str]]]:
-    sequence_chars = list(template)
-    mutations: List[Dict[str, str]] = []
+    rng: random.Random,
+    template: str,
+    theta: float,
+    indel_rate: float = 0.0,
+    max_length_delta: int = 0,
+    insertion_base_distribution: Dict[str, float] | None = None,
+) -> Tuple[str, List[Dict[str, object]], List[Dict[str, object]], List[Dict[str, object]]]:
+    substitutions: List[Dict[str, object]] = []
+    insertions: List[Dict[str, object]] = []
+    deletions: List[Dict[str, object]] = []
+
+    insertion_positions: List[int] = []
+    deletion_positions: List[int] = []
+    if indel_rate > 0.0:
+        insertion_positions = [
+            position
+            for position in range(len(template) + 1)
+            if rng.random() < indel_rate
+        ]
+        deletion_positions = [
+            position for position in range(len(template)) if rng.random() < indel_rate
+        ]
+        insertion_positions, deletion_positions = cap_net_length_delta(
+            rng=rng,
+            insertion_positions=insertion_positions,
+            deletion_positions=deletion_positions,
+            max_length_delta=max_length_delta,
+        )
+
+    insertions_by_position: Dict[int, List[str]] = {}
+    for position in insertion_positions:
+        inserted_base = sample_inserted_base(rng, insertion_base_distribution)
+        insertions_by_position.setdefault(position, []).append(inserted_base)
+        insertions.append({"position": position, "base": inserted_base})
+
+    deletion_position_set = set(deletion_positions)
+    output_chars: List[str] = []
     for index, base in enumerate(template):
-        if rng.random() >= theta:
+        output_chars.extend(insertions_by_position.get(index, []))
+        if index in deletion_position_set:
+            deletions.append({"position": index, "base": base})
             continue
+
+        output_base = base
+        if rng.random() >= theta:
+            output_chars.append(output_base)
+            continue
+
         candidates = [candidate for candidate in DNA_ALPHABET if candidate != base]
-        mutated = rng.choice(candidates)
-        sequence_chars[index] = mutated
-        mutations.append({"position": index, "from": base, "to": mutated})
-    return "".join(sequence_chars), mutations
+        output_base = rng.choice(candidates)
+        output_chars.append(output_base)
+        substitutions.append({"position": index, "from": base, "to": output_base})
+
+    output_chars.extend(insertions_by_position.get(len(template), []))
+    return "".join(output_chars), substitutions, insertions, deletions
 
 
 def choose_family_size(rng: random.Random, min_size: int, max_size: int) -> int:
@@ -284,6 +395,12 @@ def choose_family_size(rng: random.Random, min_size: int, max_size: int) -> int:
 
 def choose_theta(rng: random.Random, theta_min: float, theta_max: float) -> float:
     return rng.uniform(theta_min, theta_max)
+
+
+def choose_indel_rate(
+    rng: random.Random, indel_rate_min: float, indel_rate_max: float
+) -> float:
+    return rng.uniform(indel_rate_min, indel_rate_max)
 
 
 def sample_segment_lengths(
@@ -497,7 +614,11 @@ def summarize_records(records: Sequence[Dict[str, object]]) -> Dict[str, object]
     family_counts = Counter(record["family_id"] for record in records)
     lengths = [int(record["length"]) for record in records]
     thetas = [float(record["theta"]) for record in records]
+    indel_rates = [float(record["indel_rate"]) for record in records]
     substitutions = [int(record["num_substitutions"]) for record in records]
+    insertions = [int(record["num_insertions"]) for record in records]
+    deletions = [int(record["num_deletions"]) for record in records]
+    length_deltas = [int(record["length_delta"]) for record in records]
 
     return {
         "num_sequences": len(records),
@@ -509,8 +630,16 @@ def summarize_records(records: Sequence[Dict[str, object]]) -> Dict[str, object]
         "length_max": max(lengths) if lengths else 0,
         "theta_min": min(thetas) if thetas else 0.0,
         "theta_max": max(thetas) if thetas else 0.0,
+        "indel_rate_min": min(indel_rates) if indel_rates else 0.0,
+        "indel_rate_max": max(indel_rates) if indel_rates else 0.0,
         "substitutions_min": min(substitutions) if substitutions else 0,
         "substitutions_max": max(substitutions) if substitutions else 0,
+        "insertions_min": min(insertions) if insertions else 0,
+        "insertions_max": max(insertions) if insertions else 0,
+        "deletions_min": min(deletions) if deletions else 0,
+        "deletions_max": max(deletions) if deletions else 0,
+        "length_delta_min": min(length_deltas) if length_deltas else 0,
+        "length_delta_max": max(length_deltas) if length_deltas else 0,
     }
 
 
@@ -569,7 +698,23 @@ def main() -> None:
         )
         for family_index in range(family_size):
             theta = choose_theta(rng, args.theta_min, args.theta_max)
-            sequence, mutations = mutate_sequence(rng, template_sequence, theta)
+            indel_rate = choose_indel_rate(
+                rng, args.indel_rate_min, args.indel_rate_max
+            )
+            max_length_delta = math.floor(
+                len(template_sequence) * args.max_length_delta_ratio
+            )
+            insertion_distribution = make_base_distribution(
+                float(template["target_gc_content"])
+            )
+            sequence, substitutions, insertions, deletions = mutate_sequence(
+                rng=rng,
+                template=template_sequence,
+                theta=theta,
+                indel_rate=indel_rate,
+                max_length_delta=max_length_delta,
+                insertion_base_distribution=insertion_distribution,
+            )
             records.append(
                 {
                     "seq_id": seq_id,
@@ -580,8 +725,15 @@ def main() -> None:
                     "sequence": sequence,
                     "length": len(sequence),
                     "theta": theta,
-                    "num_substitutions": len(mutations),
-                    "mutations": mutations,
+                    "indel_rate": indel_rate,
+                    "num_substitutions": len(substitutions),
+                    "num_insertions": len(insertions),
+                    "num_deletions": len(deletions),
+                    "length_delta": len(sequence) - len(template_sequence),
+                    "mutations": substitutions,
+                    "substitutions": substitutions,
+                    "insertions": insertions,
+                    "deletions": deletions,
                     "template_sequence": template_sequence,
                     "target_gc_content": template["target_gc_content"],
                     "realized_template_gc_content": template["realized_gc_content"],

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """PyTorch episode dataset for synthetic DNA grouping.
 
-Each episode contains N sequences of the same length and an NxN relation matrix
+Each episode contains N padded DNA sequences and an NxN relation matrix
 whose entries are 1 when the two sequences come from the same family.
 
 The dataset can mix multiple source directories (for example uniform-GC and
@@ -24,6 +24,7 @@ from torch.utils.data import BatchSampler, Dataset, DataLoader
 
 
 DNA_VOCAB = {"A": 0, "C": 1, "G": 2, "T": 3}
+PAD_TOKEN_ID = 4
 
 
 @dataclass(frozen=True)
@@ -40,6 +41,7 @@ class SequenceRecord:
 @dataclass(frozen=True)
 class EpisodeSpec:
     length: int
+    sequence_lengths: tuple[int, ...]
     record_indices: tuple[int, ...]
     family_ids: tuple[int, ...]
     source_names: tuple[str, ...]
@@ -56,6 +58,27 @@ def read_jsonl(path: Path) -> Iterable[dict]:
 
 def encode_sequence(sequence: str) -> List[int]:
     return [DNA_VOCAB[base] for base in sequence]
+
+
+def pad_encoded_sequences(
+    encoded_sequences: Sequence[Sequence[int]], max_length: int | None = None
+) -> torch.Tensor:
+    if not encoded_sequences:
+        raise ValueError("Cannot pad an empty sequence list.")
+    padded_length = max_length
+    if padded_length is None:
+        padded_length = max(len(sequence) for sequence in encoded_sequences)
+
+    padded = torch.full(
+        (len(encoded_sequences), padded_length),
+        fill_value=PAD_TOKEN_ID,
+        dtype=torch.long,
+    )
+    for row, sequence in enumerate(encoded_sequences):
+        if len(sequence) > padded_length:
+            raise ValueError("Encoded sequence is longer than the requested padding length.")
+        padded[row, : len(sequence)] = torch.tensor(sequence, dtype=torch.long)
+    return padded
 
 
 def build_relation_matrix(family_ids: Sequence[int]) -> torch.Tensor:
@@ -146,9 +169,7 @@ class DnaEpisodeDataset(Dataset):
 
         self.data_dirs = [Path(data_dir) for data_dir in data_dirs]
         self.records: List[SequenceRecord] = []
-        self.indices_by_length_and_family: Dict[int, Dict[int, List[int]]] = defaultdict(
-            lambda: defaultdict(list)
-        )
+        self.indices_by_family: Dict[int, List[int]] = defaultdict(list)
         self.lengths: List[int] = []
 
         self._load_records()
@@ -174,39 +195,27 @@ class DnaEpisodeDataset(Dataset):
                 )
                 record_index = len(self.records)
                 self.records.append(record)
-                self.indices_by_length_and_family[record.length][record.family_id].append(
-                    record_index
-                )
+                self.indices_by_family[record.family_id].append(record_index)
 
-        eligible_lengths = []
-        for length, family_to_indices in self.indices_by_length_and_family.items():
-            eligible_families = [
-                family_id
-                for family_id, indices in family_to_indices.items()
-                if len(indices) >= 1
-            ]
-            if len(eligible_families) >= min(
-                self.episode_size, self.families_per_episode_min
-            ):
-                eligible_lengths.append(length)
+        eligible_families = [
+            family_id
+            for family_id, indices in self.indices_by_family.items()
+            if len(indices) >= 1
+        ]
+        if len(eligible_families) < min(
+            self.episode_size, self.families_per_episode_min
+        ):
+            raise ValueError("No eligible families found for the requested split.")
 
-        if not eligible_lengths:
-            raise ValueError("No eligible lengths found for the requested split.")
-
-        self.lengths = sorted(eligible_lengths)
+        self.lengths = sorted({record.length for record in self.records})
 
     def _build_length_weights(self) -> List[float]:
         if self.length_sampling == "uniform":
             return [1.0 for _ in self.lengths]
-        return [
-            float(
-                sum(
-                    len(indices)
-                    for indices in self.indices_by_length_and_family[length].values()
-                )
-            )
-            for length in self.lengths
-        ]
+        length_counts = defaultdict(int)
+        for record in self.records:
+            length_counts[record.length] += 1
+        return [float(length_counts[length]) for length in self.lengths]
 
     def _choose_length(self, rng: random.Random) -> int:
         return rng.choices(self.lengths, weights=self.length_weights, k=1)[0]
@@ -219,9 +228,8 @@ class DnaEpisodeDataset(Dataset):
         positive_fraction = positive_pairs / total_pairs
         return self.positive_fraction_min <= positive_fraction <= self.positive_fraction_max
 
-    def _sample_episode_spec_for_length(self, rng: random.Random, length: int) -> EpisodeSpec:
-        family_to_indices = self.indices_by_length_and_family[length]
-        family_ids = sorted(family_to_indices.keys())
+    def _sample_episode_spec_once(self, rng: random.Random) -> EpisodeSpec:
+        family_ids = sorted(self.indices_by_family.keys())
 
         max_families = min(
             self.families_per_episode_max, self.episode_size, len(family_ids)
@@ -240,7 +248,7 @@ class DnaEpisodeDataset(Dataset):
         sampled_segmented_flags: List[bool] = []
 
         for family_id, count in zip(chosen_families, counts):
-            candidates = family_to_indices[family_id]
+            candidates = self.indices_by_family[family_id]
             if len(candidates) >= count:
                 selected = rng.sample(candidates, count)
             else:
@@ -258,9 +266,13 @@ class DnaEpisodeDataset(Dataset):
         shuffled_family_ids = tuple(sampled_family_ids[i] for i in permutation)
         shuffled_source_names = tuple(sampled_source_names[i] for i in permutation)
         shuffled_segmented_flags = tuple(sampled_segmented_flags[i] for i in permutation)
+        shuffled_lengths = tuple(
+            self.records[record_index].length for record_index in shuffled_indices
+        )
 
         return EpisodeSpec(
-            length=length,
+            length=max(shuffled_lengths),
+            sequence_lengths=shuffled_lengths,
             record_indices=shuffled_indices,
             family_ids=shuffled_family_ids,
             source_names=shuffled_source_names,
@@ -269,9 +281,8 @@ class DnaEpisodeDataset(Dataset):
 
     def _sample_episode_spec(self, rng: random.Random) -> EpisodeSpec:
         for _ in range(self.max_episode_sampling_attempts):
-            length = self._choose_length(rng)
             try:
-                return self._sample_episode_spec_for_length(rng, length)
+                return self._sample_episode_spec_once(rng)
             except ValueError:
                 continue
         raise RuntimeError(
@@ -290,9 +301,8 @@ class DnaEpisodeDataset(Dataset):
         spec = self.episode_specs[index]
         records = [self.records[record_index] for record_index in spec.record_indices]
         sequences = [record.sequence for record in records]
-        input_ids = torch.tensor(
-            [encode_sequence(sequence) for sequence in sequences], dtype=torch.long
-        )
+        encoded_sequences = [encode_sequence(sequence) for sequence in sequences]
+        input_ids = pad_encoded_sequences(encoded_sequences, max_length=spec.length)
         family_ids = torch.tensor(spec.family_ids, dtype=torch.long)
         label_matrix = build_relation_matrix(spec.family_ids)
 
@@ -302,13 +312,14 @@ class DnaEpisodeDataset(Dataset):
             "family_ids": family_ids,
             "label_matrix": label_matrix,
             "length": spec.length,
+            "sequence_lengths": torch.tensor(spec.sequence_lengths, dtype=torch.long),
             "source_names": list(spec.source_names),
             "uses_segmented_gc": torch.tensor(spec.segmented_flags, dtype=torch.bool),
         }
 
 
 class LengthBucketBatchSampler(BatchSampler):
-    """Groups pre-sampled episodes into same-length batches."""
+    """Groups pre-sampled episodes by padded episode length."""
 
     def __init__(
         self,
@@ -357,15 +368,29 @@ def episode_collate_fn(batch: Sequence[dict]) -> dict:
     if not batch:
         raise ValueError("Cannot collate an empty batch.")
 
-    lengths = {item["length"] for item in batch}
-    if len(lengths) != 1:
-        raise ValueError("All episodes in a batch must have the same sequence length.")
+    max_length = max(int(item["length"]) for item in batch)
+    padded_input_ids = []
+    for item in batch:
+        input_ids = item["input_ids"]
+        if input_ids.shape[-1] == max_length:
+            padded_input_ids.append(input_ids)
+            continue
+        padded = torch.full(
+            (input_ids.shape[0], max_length),
+            fill_value=PAD_TOKEN_ID,
+            dtype=input_ids.dtype,
+        )
+        padded[:, : input_ids.shape[-1]] = input_ids
+        padded_input_ids.append(padded)
 
     return {
-        "input_ids": torch.stack([item["input_ids"] for item in batch], dim=0),
+        "input_ids": torch.stack(padded_input_ids, dim=0),
         "family_ids": torch.stack([item["family_ids"] for item in batch], dim=0),
         "label_matrix": torch.stack([item["label_matrix"] for item in batch], dim=0),
-        "length": batch[0]["length"],
+        "length": max_length,
+        "sequence_lengths": torch.stack(
+            [item["sequence_lengths"] for item in batch], dim=0
+        ),
         "sequences": [item["sequences"] for item in batch],
         "source_names": [item["source_names"] for item in batch],
         "uses_segmented_gc": torch.stack(
@@ -481,6 +506,7 @@ def main() -> None:
     print(f"batch_input_shape={tuple(first_batch['input_ids'].shape)}")
     print(f"batch_label_shape={tuple(first_batch['label_matrix'].shape)}")
     print(f"batch_length={first_batch['length']}")
+    print(f"batch_sequence_lengths={first_batch['sequence_lengths'].tolist()}")
     print(
         "segmented_counts="
         f"{int(first_batch['uses_segmented_gc'].sum().item())}/"

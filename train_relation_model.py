@@ -174,8 +174,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--sequence-vocab-size",
         type=int,
-        default=4,
-        help="Vocabulary size for the DNA token embedding.",
+        default=5,
+        help="Vocabulary size for the DNA token embedding, including PAD.",
     )
     parser.add_argument(
         "--sequence-hidden-dim",

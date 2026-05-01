@@ -30,7 +30,7 @@ LOG_NAME="${LOG_NAME:-${PBS_JOBNAME}_${PBS_JOBID}.log}"
 
 python /scratch/tml6120/dna_grouper/train_relation_model.py \
   --data-root /home/grads/tml6120/workspace/dna_grouper/data/mixed_segmented_uniform \
-  --families-per-episode-min 6 \
+  --families-per-episode-min 8\
   --families-per-episode-max 32 \
   --epochs 10 \
   --encoder-only-epochs 100 \
@@ -39,13 +39,12 @@ python /scratch/tml6120/dna_grouper/train_relation_model.py \
   --train-episodes-per-epoch 1024 \
   --eval-episodes 512 \
   --batch-size 16 \
-  --episode-size 32 \
+  --episode-size 64 \
   --learning-rate 5e-4 \
   --positive-weight-scale 1.0 \
   --diagonal-weight 0.02 \
   --alternate-epochs \
   --relation-head-type cosine \
-  --set-num-heads 4 \
   --set-num-layers 8 \
   --set-dropout 0.15 \
   2>&1 | tee "$LOG_DIR/$LOG_NAME"

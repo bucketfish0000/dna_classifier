@@ -29,7 +29,7 @@ mkdir -p "$LOG_DIR"
 LOG_NAME="${LOG_NAME:-${PBS_JOBNAME}_${PBS_JOBID}.log}"
 
 python /scratch/tml6120/dna_grouper/train_relation_model.py \
-  --data-root /home/grads/tml6120/workspace/dna_grouper/data/segmented/L200 \
+  --data-root /home/grads/tml6120/workspace/dna_grouper/data/mixed_segmented_uniform/segmented_L200 \
   --epochs 10 \
   --encoder-only-epochs 10 \
   --set-only-epochs 10\

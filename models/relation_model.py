@@ -15,7 +15,7 @@ class RelationModel(nn.Module):
     """Compose sequence encoder, set encoder, and relation head.
 
     Expected input shape:
-    - input_ids: (batch_size, num_sequences, sequence_length)
+    - input_ids: (batch_size, num_sequences, padded_sequence_length)
 
     Output shape:
     - logits: (batch_size, num_sequences, num_sequences)
